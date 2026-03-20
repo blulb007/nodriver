@@ -23,9 +23,17 @@ from .. import cdp
 from . import tab, util
 from ._contradict import ContraDict
 from .config import Config, PathLike, is_posix
-from .connection import Connection
+from .connection import Connection, ProtocolException
 
 logger = logging.getLogger(__name__)
+
+ATTACHABLE_TARGET_TYPES = {
+    "page",
+    "iframe",
+    "worker",
+    "service_worker",
+    "shared_worker",
+}
 
 
 class Browser:
@@ -121,6 +129,7 @@ class Browser:
         self._process_pid = None
         self._keep_user_data_dir = None
         self._is_updating = asyncio.Event()
+        self._stopping = False
         self.connection: Connection = None
         logger.debug("Session object initialized: %s" % vars(self))
 
@@ -168,11 +177,52 @@ class Browser:
                 ],
                 return_when=asyncio.ALL_COMPLETED,
             )
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, ProtocolException):
             pass
 
     sleep = wait
     """alias for wait"""
+
+    def _schedule_attach(self, target_info: cdp.target.TargetInfo):
+        async def _attach():
+            await self.connection.attach_target(target_info)
+
+        task = asyncio.create_task(_attach())
+
+        def _consume(task_: asyncio.Task):
+            try:
+                task_.result()
+            except ProtocolException:
+                logger.debug(
+                    "attach task ended during target lifecycle churn: %s",
+                    target_info.target_id,
+                )
+            except Exception:
+                logger.debug(
+                    "attach task failed for target %s",
+                    target_info.target_id,
+                    exc_info=True,
+                )
+
+        task.add_done_callback(_consume)
+        return task
+
+    def _schedule_update_targets(self):
+        task = asyncio.create_task(self.update_targets())
+
+        def _consume(task_: asyncio.Task):
+            try:
+                task_.result()
+            except ProtocolException:
+                if self._stopping or not self.connection or self.connection.closed:
+                    logger.debug("ignored update_targets failure during shutdown")
+                else:
+                    logger.debug("update_targets failed", exc_info=True)
+            except Exception:
+                logger.debug("update_targets failed", exc_info=True)
+
+        task.add_done_callback(_consume)
+        return task
 
     def _handle_target_update(
         self,
@@ -188,11 +238,9 @@ class Browser:
         if isinstance(event, cdp.target.TargetInfoChanged):
             target_info = event.target_info
 
-            current_tab = next(
-                filter(
-                    lambda item: item.target_id == target_info.target_id, self.targets
-                )
-            )
+            current_tab = self.connection.targets.get(target_info.target_id)
+            if not current_tab:
+                return
             current_target = current_tab.target
 
             if logger.getEffectiveLevel() <= 10:
@@ -205,38 +253,37 @@ class Browser:
                     "target #%d has changed: %s"
                     % (self.targets.index(current_tab), changes_string)
                 )
-
-                current_tab._target = target_info
+            current_tab._target = target_info
 
         elif isinstance(event, cdp.target.TargetCreated):
             target_info: cdp.target.TargetInfo = event.target_info
-            from .tab import Tab
-
-            new_target = Tab(
-                (
-                    f"ws://{self.config.host}:{self.config.port}"
-                    f"/devtools/{target_info.type_ or 'page'}"  # all types are 'page' internally in chrome apparently
-                    f"/{target_info.target_id}"
-                ),
-                target=target_info,
-                browser=self,
-            )
-
-            self.targets.append(new_target)
-
-            logger.debug("target #%d created => %s", len(self.targets), new_target)
+            new_target = self.connection._upsert_target_connection(target_info)
+            logger.debug("target discovered => %s", new_target)
+            if new_target.type_ in ATTACHABLE_TARGET_TYPES:
+                self._schedule_attach(target_info)
 
         elif isinstance(event, cdp.target.TargetDestroyed):
-            current_tab = next(
-                filter(lambda item: item.target_id == event.target_id, self.targets)
-            )
-            logger.debug(
-                "target removed. id # %d => %s"
-                % (self.targets.index(current_tab), current_tab)
-            )
-            self.targets.remove(current_tab)
+            current_tab = self.connection.targets.get(event.target_id)
+            if current_tab:
+                logger.debug("target removed => %s", current_tab)
+                self.connection._cleanup_target(
+                    current_tab,
+                    reason=f"target destroyed: {event.target_id}",
+                    remove_target=True,
+                    mark_closed=True,
+                )
 
-        asyncio.create_task(self.update_targets())
+        elif isinstance(event, cdp.target.TargetCrashed):
+            current_tab = self.connection.targets.get(event.target_id)
+            if current_tab:
+                logger.debug("target crashed => %s", current_tab)
+                self.connection._cleanup_target(
+                    current_tab,
+                    reason=f"target crashed: {event.target_id}",
+                    mark_crashed=True,
+                )
+
+        self._schedule_update_targets()
 
     async def get(
         self, url="chrome://welcome", new_tab: bool = False, new_window: bool = False
@@ -266,6 +313,8 @@ class Browser:
                     self.targets,
                 )
             )
+            if not connection.session_id:
+                connection = await self.connection.attach_target(connection.target)
             connection._browser = self
 
         else:
@@ -273,6 +322,8 @@ class Browser:
             connection: tab.Tab = next(
                 filter(lambda item: item.type_ == "page", self.targets)
             )
+            if not connection.session_id:
+                connection = await self.connection.attach_target(connection.target)
             # use the tab to navigate to new url
             frame_id, loader_id, *_ = await connection.send(cdp.page.navigate(url))
             # update the frame_id on the tab
@@ -352,6 +403,8 @@ class Browser:
                 self.targets,
             )
         )
+        if not connection.session_id:
+            connection = await self.connection.attach_target(connection.target)
         return connection
 
     async def start(self=None) -> Browser:
@@ -449,6 +502,12 @@ class Browser:
             )
 
         self.connection = Connection(self.info.webSocketDebuggerUrl, browser=self)
+        self.connection.handlers[cdp.target.AttachedToTarget] = [
+            self.connection._handle_attached_to_target
+        ]
+        self.connection.handlers[cdp.target.DetachedFromTarget] = [
+            self.connection._handle_detached_from_target
+        ]
 
         if self.config.autodiscover_targets:
             logger.info("enabling autodiscover targets")
@@ -466,6 +525,15 @@ class Browser:
                 self._handle_target_update
             ]
             await self.connection.send(cdp.target.set_discover_targets(discover=True))
+            self.connection._discovery_registered = True
+            await self.connection.send(
+                cdp.target.set_auto_attach(
+                    auto_attach=True,
+                    wait_for_debugger_on_start=False,
+                    flatten=True,
+                )
+            )
+            self.connection._flatten_auto_attach_registered = True
 
         await self.update_targets()
         await self
@@ -569,27 +637,32 @@ class Browser:
         return info
 
     async def update_targets(self):
+        if self._stopping or not self.connection or self.connection.closed:
+            return []
         targets: List[cdp.target.TargetInfo]
-        targets = await self._get_targets()
+        try:
+            targets = await self._get_targets()
+        except ProtocolException:
+            if self._stopping or not self.connection or self.connection.closed:
+                return []
+            raise
         target_ids = [t.target_id for t in targets]
-        existing_target_ids = [t.target_id for t in self.targets]
         for t in targets:
-            for existing_tab in self.targets:
-                existing_target = existing_tab.target
-                if existing_target.target_id == t.target_id:
-                    existing_tab.target.__dict__.update(t.__dict__)
-                    break
+            existing_tab = self.connection.targets.get(t.target_id)
+            if existing_tab:
+                existing_tab.target.__dict__.update(t.__dict__)
             else:
-                self.targets.append(
-                    Connection(
-                        (
-                            f"ws://{self.config.host}:{self.config.port}"
-                            f"/devtools/page"  # all types are 'page' somehow
-                            f"/{t.target_id}"
-                        ),
-                        target=t,
-                        browser=self,
-                    )
+                existing_tab = self.connection._upsert_target_connection(t)
+
+        stale_targets = [
+            tab for tab in list(self.targets) if tab.target_id not in target_ids
+        ]
+        for stale in stale_targets:
+            self.connection._cleanup_target(
+                stale,
+                reason=f"target removed from discovery inventory: {stale.target_id}",
+                remove_target=True,
+                    mark_closed=True,
                 )
 
         await asyncio.sleep(0)
@@ -665,6 +738,7 @@ class Browser:
                     del self._i
 
     def stop(self):
+        self._stopping = True
         try:
             # asyncio.get_running_loop().create_task(self.connection.send(cdp.browser.close()))
 

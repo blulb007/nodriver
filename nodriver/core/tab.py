@@ -165,9 +165,19 @@ class Tab(Connection):
         websocket_url: str,
         target: cdp.target.TargetInfo,
         browser: Optional["nodriver.Browser"] = None,
+        *,
+        root: Optional[Connection] = None,
+        session_id: Optional[cdp.target.SessionID] = None,
         **kwargs,
     ):
-        super().__init__(websocket_url, target, browser, **kwargs)
+        super().__init__(
+            websocket_url,
+            target,
+            browser,
+            root=root,
+            session_id=session_id,
+            **kwargs,
+        )
         self._dom = None
         self._window_id = None
 
@@ -179,7 +189,11 @@ class Tab(Connection):
         :return:
         :rtype:
         """
-        return f"http://{self.browser.config.host}:{self.browser.config.port}/devtools/inspector.html?ws={self.websocket_url[5:]}"
+        ws_path = (
+            f"{self.browser.config.host}:{self.browser.config.port}"
+            f"/devtools/{self.type_ or 'page'}/{self.target_id}"
+        )
+        return f"http://{self.browser.config.host}:{self.browser.config.port}/devtools/inspector.html?ws={ws_path}"
 
     def inspector_open(self):
         import webbrowser
